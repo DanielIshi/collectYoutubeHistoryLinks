@@ -1,16 +1,38 @@
 #!/usr/bin/env python3
 import os, sys, argparse, json, re, datetime, requests
 from typing import Optional, Tuple
+from pathlib import Path
+from dotenv import load_dotenv
 
 # --- YouTube via pytubefix (ohne PoToken) ---
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
 
-# --- Supabase-Konfiguration ---
-SUPABASE_URL = "http://148.230.71.150:8000/rest/v1"
-SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJpYXQiOjE3NTQ2MDQwMDAsImV4cCI6MTkxMjM3MDQwMH0.U6IEB3t9Qw8QIH_VADtqixYhyrwrDJkpBWI2nlDxJ6w'
+# --- .env laden ---
+env_path = Path(__file__).parent / '.env'
+if not env_path.exists():
+    print("❌ FEHLER: .env Datei nicht gefunden!")
+    print(f"   Erwarteter Pfad: {env_path}")
+    print("   Erstelle .env aus .env.example und fülle die Werte aus.")
+    sys.exit(1)
 
-REST_URL = SUPABASE_URL
+load_dotenv(env_path)
+
+# --- Supabase-Konfiguration aus .env ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "youtube_urls")
+
+# Validierung
+if not SUPABASE_URL:
+    print("❌ FEHLER: SUPABASE_URL nicht in .env gesetzt!")
+    sys.exit(1)
+
+if not SUPABASE_SERVICE_ROLE_KEY:
+    print("❌ FEHLER: SUPABASE_SERVICE_KEY nicht in .env gesetzt!")
+    sys.exit(1)
+
+REST_URL = f"{SUPABASE_URL}/rest/v1"
 HDRS = {
     "apikey": SUPABASE_SERVICE_ROLE_KEY,
     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -84,7 +106,7 @@ def upsert_result(url: str, title: str, text: Optional[str], source: str, priori
     }
     if text:
         payload["subtitles"] = text
-    r = requests.post(f"{REST_URL}/youtube_urls?on_conflict=url",
+    r = requests.post(f"{REST_URL}/{SUPABASE_TABLE}?on_conflict=url",
                       headers=HDRS, json=[payload], timeout=30)
     if not r.ok:
         raise RuntimeError(f"Supabase upsert failed: {r.status_code} {r.text}")
@@ -98,16 +120,16 @@ def load_unprocessed_urls() -> list[str]:
         "select": "url",
         "order": "added_at.asc"
     }
-    r = requests.get(f"{REST_URL}/youtube_urls", headers=HDRS, params=params, timeout=30)
+    r = requests.get(f"{REST_URL}/{SUPABASE_TABLE}", headers=HDRS, params=params, timeout=30)
     if not r.ok:
         raise RuntimeError(f"❌ Fehler beim Abruf der URLs: {r.status_code} {r.text}")
     return [entry["url"] for entry in r.json() if "url" in entry]
 
 def main():
     ap = argparse.ArgumentParser(description="Batch YouTube subtitles -> Supabase")
-    ap.add_argument("--lang", default=None, help="Bevorzugte Sprachspur, z.B. de oder en")
-    ap.add_argument("--source", default="vm-cron", help="Wert für Spalte 'source'")
-    ap.add_argument("--priority", type=int, default=0)
+    ap.add_argument("--lang", default=os.getenv("DEFAULT_SUBTITLE_LANG", "de"), help="Bevorzugte Sprachspur, z.B. de oder en")
+    ap.add_argument("--source", default=os.getenv("DEFAULT_SOURCE", "vm-cron"), help="Wert für Spalte 'source'")
+    ap.add_argument("--priority", type=int, default=int(os.getenv("DEFAULT_PRIORITY", "0")))
     args = ap.parse_args()
 
     urls = load_unprocessed_urls()

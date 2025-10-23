@@ -1,0 +1,1 @@
+na dann los , dann in einer Schleife immer den nächsten offenen issue holen, abarbeiten, gemäß dem Prinzip plan create test deploy, dann den nächsten issue gemäß Prioritätenliste und Meilensteinplanung       ││   nehmen, in einer Schleife, bis das Projekt fertig umgesetzt ist    
