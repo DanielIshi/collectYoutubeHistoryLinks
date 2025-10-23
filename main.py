@@ -55,10 +55,18 @@ def fetch_with_pytubefix(video_id):
         text = clean_subtitle_text(srt_text)
     print(len(text) if text else 0)
     return text
-
+def fetch_unprocessed_ids():
+    url = f"{SUPABASE_URL}/{SUPABASE_TABLE}?processed=eq.FALSE&processed_at=is.NULL&select=id"
+    response = requests.get(url, headers=HDRS, timeout=30)
+    if not response.ok:
+        raise RuntimeError(f"❌ Supabase-Abfrage fehlgeschlagen: {response.status_code} {response.text}")
+    data = response.json()
+    ids = [row["id"] for row in data]
+    print(f"🆔 {len(ids)} unprocessed IDs fetched.")
+    return ids
 # --- Funktion: YouTube-Links upserten ---
 def upsert_urls(links: list[str]):
-    payload = [{"url": link, "subtitles": fetch_with_pytubefix(link)} for link in links]
+    payload = [{"url": link} for link in links]
 
     response = requests.post(
         f"{SUPABASE_URL}/{SUPABASE_TABLE}?on_conflict=url",
@@ -70,6 +78,61 @@ def upsert_urls(links: list[str]):
     if not response.ok:
         raise RuntimeError(f"❌ Supabase-Upsert fehlgeschlagen: {response.status_code} {response.text}")
     print(f"✅ {len(links)} Links erfolgreich an Supabase gesendet.")
+
+
+
+import json
+
+# --- Vorhandene URLs aus Supabase holen ---
+def fetch_existing_urls() -> set[str]:
+    url = f"{SUPABASE_URL}/{SUPABASE_TABLE}?select=url"
+    response = requests.get(url, headers=HDRS, timeout=30)
+    if not response.ok:
+        raise RuntimeError(f"❌ Supabase-Query fehlgeschlagen: {response.status_code} {response.text}")
+    data = response.json()
+    existing = {row["url"] for row in data if row.get("url")}
+    print(f"📂 {len(existing)} URLs bereits in Supabase vorhanden.")
+    return existing
+
+def extract_video_id(url: str) -> str:
+    import re
+    from urllib.parse import urlparse, parse_qs
+    # Versucht, die ID aus verschiedenen YouTube-URL-Formaten zu extrahieren
+    parsed = urlparse(url)
+    if parsed.hostname in ["www.youtube.com", "youtube.com"]:
+        query = parse_qs(parsed.query)
+        return query.get("v", [""])[0]
+    elif parsed.hostname in ["youtu.be"]:
+        return parsed.path.lstrip("/")
+    else:
+        return ""
+# --- YouTube-Links upserten ---
+def upsert_urls(links: list[str]):
+    if not links:
+        print("ℹ️ Keine neuen Links zum Einfügen.")
+        return
+
+    payload = [{"url": link, "subtitles": fetch_with_pytubefix(extract_video_id(link))} for link in links]
+    response = requests.post(
+        f"{SUPABASE_URL}/{SUPABASE_TABLE}?on_conflict=url",
+        headers=HDRS,
+        json=payload,
+        timeout=30
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"❌ Supabase-Upsert fehlgeschlagen: {response.status_code} {response.text}")
+    print(f"✅ {len(links)} neue Links erfolgreich an Supabase gesendet.")
+
+
+
+
+
+
+
+
+
+
 
 # --- Chrome starten (Debug-Modus) ---
 chrome_cmd = [
@@ -109,11 +172,19 @@ print(f"🔗 {len(links)} YouTube-Links gesammelt.")
 
 # --- CSV speichern ---
 df = pd.DataFrame(links, columns=["url"])
-df.to_csv("youtube_links.csv", index=False)
+output_path = r"C:\Users\Daniel\PycharmProjects\collectYoutubeHistoryLinks\youtube_links.csv"
+df.to_csv(output_path, index=False)
 print("💾 youtube_links.csv gespeichert.")
 
 # --- In Supabase schreiben ---
-upsert_urls(links)
+# --- Vorhandene URLs abgleichen ---
+existing = fetch_existing_urls()
+new_links = [link for link in links if link not in existing]
+print(f"➕ {len(new_links)} neue Links gefunden.")
+
+# --- Nur neue Links in Supabase schreiben ---
+upsert_urls(new_links)
+
 
 # --- Browser schließen ---
 driver.quit()
