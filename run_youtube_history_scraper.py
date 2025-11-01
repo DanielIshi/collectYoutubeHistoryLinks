@@ -26,7 +26,13 @@ from pytubefix import YouTube
 from pytubefix.cli import on_progress
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
 from dotenv import load_dotenv
+import platform
+import zipfile
+import shutil
+import io
 
 # --- .env laden ---
 env_path = Path(__file__).parent / '.env'
@@ -223,7 +229,7 @@ def scrape_youtube_history() -> List[str]:
     print("\n📺 Verbinde mit Chrome via Selenium...")
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{DEBUG_PORT}")
-    driver = webdriver.Chrome(options=options)
+    driver = _create_chrome_driver(options)
 
     try:
         print("🔍 Navigiere zu YouTube-Historie...")
@@ -245,6 +251,143 @@ def scrape_youtube_history() -> List[str]:
 
     finally:
         driver.quit()
+
+
+def _get_chrome_major_version() -> int:
+    """Ermittelt die installierte Chrome-Hauptversion (z. B. 141)."""
+    try:
+        res = requests.get(f"http://localhost:{DEBUG_PORT}/json/version", timeout=2)
+        if res.ok:
+            data = res.json()
+            browser = data.get("Browser", "")
+            m = re.search(r"Chrome/(\d+)", browser)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output([CHROME_PATH, "--version"], stderr=subprocess.STDOUT, text=True, timeout=5)
+        m = re.search(r"(Chrome|Chromium)\s+(\d+)", out)
+        if m:
+            return int(m.group(2))
+    except Exception:
+        pass
+    raise RuntimeError("Konnte Chrome-Version nicht ermitteln.")
+
+
+def _get_chromedriver_major_version(driver_path: Path) -> int:
+    try:
+        out = subprocess.check_output([str(driver_path), "--version"], stderr=subprocess.STDOUT, text=True, timeout=5)
+        m = re.search(r"ChromeDriver\s+(\d+)", out)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return -1
+
+
+def _download_chromedriver_for_major(major: int, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    arch = "win64" if "64" in platform.machine() else "win32"
+    meta_url = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+    r = requests.get(meta_url, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    target = None
+    for v in data.get("versions", [])[::-1]:
+        ver = v.get("version", "")
+        if ver.startswith(f"{major}."):
+            for item in v.get("downloads", {}).get("chromedriver", []):
+                if item.get("platform") == ("win64" if arch == "win64" else "win32"):
+                    target = (ver, item.get("url"))
+                    break
+        if target:
+            break
+    if not target:
+        raise RuntimeError(f"Kein ChromeDriver-Download für Chrome {major} gefunden.")
+    ver, url = target
+    zip_path = dest_dir / f"chromedriver-{ver}-{arch}.zip"
+    resp = requests.get(url, stream=True, timeout=60)
+    resp.raise_for_status()
+    with open(zip_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+    import zipfile, shutil
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        member = next((m for m in zf.namelist() if m.endswith("chromedriver.exe")), None)
+        if not member:
+            raise RuntimeError("chromedriver.exe nicht im ZIP gefunden")
+        extract_dir = dest_dir / f"chromedriver-{ver}-{arch}"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        zf.extract(member, extract_dir)
+        extracted = extract_dir / member
+        final_exe = extract_dir / "chromedriver.exe"
+        final_exe.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(extracted), final_exe)
+        parts = member.split("/")
+        if len(parts) > 1:
+            top = extract_dir / parts[0]
+            try:
+                shutil.rmtree(top)
+            except Exception:
+                pass
+    try:
+        zip_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return final_exe
+
+
+def _ensure_matching_chromedriver(project_root: Path) -> Path:
+    chrome_major = _get_chrome_major_version()
+    driver_root = project_root / "chromedriver.exe"
+    current_major = _get_chromedriver_major_version(driver_root) if driver_root.exists() else -1
+    if current_major == chrome_major and driver_root.exists():
+        return driver_root
+    if driver_root.exists():
+        archive_dir = project_root / "drivers" / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out = subprocess.check_output([str(driver_root), "--version"], stderr=subprocess.STDOUT, text=True, timeout=5)
+            mfull = re.search(r"ChromeDriver\s+([0-9.]+)", out)
+            ver_str = mfull.group(1) if mfull else f"{current_major}"
+        except Exception:
+            ver_str = f"{current_major}"
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        archived = archive_dir / f"chromedriver-{ver_str}-{ts}.exe"
+        try:
+            shutil.move(str(driver_root), archived)
+            print(f"? Alter ChromeDriver archiviert: {archived}")
+        except Exception as e:
+            print(f"[WARN] Konnte alten ChromeDriver nicht archivieren: {e}")
+    print(f"?? Lade passenden ChromeDriver für Chrome {chrome_major}...")
+    dl_dir = project_root / "drivers" / "downloads"
+    new_exe = _download_chromedriver_for_major(chrome_major, dl_dir)
+    try:
+        shutil.copyfile(new_exe, driver_root)
+    except Exception as e:
+        raise RuntimeError(f"Konnte neuen ChromeDriver nicht bereitstellen: {e}")
+    print(f"V Neuer ChromeDriver installiert: {driver_root}")
+    return driver_root
+
+
+def _create_chrome_driver(options: Options):
+    try:
+        return webdriver.Chrome(options=options)
+    except (SessionNotCreatedException, WebDriverException) as e:
+        msg = str(e)
+        mismatch = (
+            "only supports Chrome version" in msg
+            or "session not created" in msg.lower()
+            or "This version of ChromeDriver" in msg
+        )
+        if not mismatch:
+            raise
+        print("[INFO] Detektierter Treiber/Browser-Versionskonflikt. Aktualisiere ChromeDriver...")
+        driver_path = _ensure_matching_chromedriver(Path(__file__).parent)
+        service = Service(executable_path=str(driver_path))
+        return webdriver.Chrome(service=service, options=options)
 
 
 # --- Hauptlogik ---
